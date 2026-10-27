@@ -16,27 +16,29 @@ import java.nio.FloatBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
-class VideoRenderer(private val context: Context) :
-    GLSurfaceView.Renderer, SurfaceTexture.OnFrameAvailableListener {
+class VideoRenderer(private val context: Context) : GLSurfaceView.Renderer {
+
+    private class Slot {
+        var texId = 0
+        var st: SurfaceTexture? = null
+        var surface: Surface? = null
+        var player: MediaPlayer? = null
+        @Volatile var frameAvailable = false
+        var hasFrame = false
+        @Volatile var prepared = false
+        @Volatile var wantPlay = false
+        @Volatile var ended = false
+        @Volatile var targetMs = 0L
+        @Volatile var videoW = 0
+        @Volatile var videoH = 0
+        @Volatile var visible = false
+        @Volatile var opacity = 1f
+        val stMatrix = FloatArray(16)
+    }
 
     private val OES = GLES11Ext.GL_TEXTURE_EXTERNAL_OES
     private var program = 0
-    private var texId = 0
-    @Volatile private var surfaceTexture: SurfaceTexture? = null
-    private var player: MediaPlayer? = null
-    @Volatile private var frameAvailable = false
-    private var hasFrame = false
-    private val startTime = System.nanoTime()
-    private val stMatrix = FloatArray(16)
-
-    @Volatile var effectOn = false
-    @Volatile var showVideo = true
-    @Volatile var ended = false
-    @Volatile private var videoW = 0
-    @Volatile private var videoH = 0
-    @Volatile private var prepared = false
-    @Volatile private var wantPlay = false
-    @Volatile private var targetMs = 0L
+    private val slots = Array(MAX_TRACKS) { Slot() }
     private var surfaceW = 1
     private var surfaceH = 1
 
@@ -63,36 +65,46 @@ class VideoRenderer(private val context: Context) :
         varying vec2 vUv;
         uniform samplerExternalOES uTex;
         uniform mat4 uSTMatrix;
-        uniform float uTime;
-        uniform float uEffect;
+        uniform float uOpacity;
         void main() {
-            vec2 uv = vUv;
-            if (uEffect > 0.5) {
-                vec2 c = uv - 0.5;
-                float d = length(c);
-                uv += normalize(c + 0.0001) * 0.02 * sin(d * 40.0 - uTime * 4.0);
-            }
-            vec2 t = (uSTMatrix * vec4(uv, 0.0, 1.0)).xy;
-            gl_FragColor = texture2D(uTex, t);
+            vec2 t = (uSTMatrix * vec4(vUv, 0.0, 1.0)).xy;
+            vec4 c = texture2D(uTex, t);
+            gl_FragColor = vec4(c.rgb, uOpacity);
         }
     """
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         program = buildProgram(vertexShader, fragmentShader)
-        val t = IntArray(1)
-        GLES20.glGenTextures(1, t, 0)
-        texId = t[0]
-        GLES20.glBindTexture(OES, texId)
-        GLES20.glTexParameteri(OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-        GLES20.glTexParameteri(OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-        GLES20.glTexParameteri(OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-        Matrix.setIdentityM(stMatrix, 0)
-        hasFrame = false
-        val st = SurfaceTexture(texId)
-        st.setOnFrameAvailableListener(this)
-        surfaceTexture = st
-        player?.setSurface(Surface(st))
+        for (s in slots) {
+            val t = IntArray(1)
+            GLES20.glGenTextures(1, t, 0)
+            s.texId = t[0]
+            GLES20.glBindTexture(OES, s.texId)
+            GLES20.glTexParameteri(OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+            GLES20.glTexParameteri(OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+            GLES20.glTexParameteri(OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+            Matrix.setIdentityM(s.stMatrix, 0)
+            s.hasFrame = false
+            s.frameAvailable = false
+
+            val oldSt = s.st
+            val oldSurface = s.surface
+            val st = SurfaceTexture(s.texId)
+            st.setOnFrameAvailableListener { s.frameAvailable = true }
+            val sf = Surface(st)
+            s.st = st
+            s.surface = sf
+            s.player?.setSurface(sf)
+            try {
+                oldSurface?.release()
+            } catch (e: Exception) {
+            }
+            try {
+                oldSt?.release()
+            } catch (e: Exception) {
+            }
+        }
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
@@ -105,56 +117,56 @@ class VideoRenderer(private val context: Context) :
         GLES20.glViewport(0, 0, surfaceW, surfaceH)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-        val st = surfaceTexture ?: return
-        if (frameAvailable) {
-            frameAvailable = false
-            st.updateTexImage()
-            st.getTransformMatrix(stMatrix)
-            hasFrame = true
-        }
-        if (!hasFrame || !showVideo) return
+        if (program == 0) return
 
-        var vx = 0
-        var vy = 0
-        var vw = surfaceW
-        var vh = surfaceH
-        if (videoW > 0 && videoH > 0) {
-            val videoAspect = videoW.toFloat() / videoH
-            val screenAspect = surfaceW.toFloat() / surfaceH
-            if (videoAspect > screenAspect) {
-                vh = (surfaceW / videoAspect).toInt()
-                vy = (surfaceH - vh) / 2
-            } else {
-                vw = (surfaceH * videoAspect).toInt()
-                vx = (surfaceW - vw) / 2
-            }
-        }
-        GLES20.glViewport(vx, vy, vw, vh)
-
+        GLES20.glEnable(GLES20.GL_BLEND)
+        GLES20.glBlendFunc(GLES20.GL_SRC_ALPHA, GLES20.GL_ONE_MINUS_SRC_ALPHA)
         GLES20.glUseProgram(program)
         val pos = GLES20.glGetAttribLocation(program, "aPosition")
         val uv = GLES20.glGetAttribLocation(program, "aUv")
-        GLES20.glEnableVertexAttribArray(pos)
-        GLES20.glVertexAttribPointer(pos, 2, GLES20.GL_FLOAT, false, 0, vertexBuf)
-        GLES20.glEnableVertexAttribArray(uv)
-        GLES20.glVertexAttribPointer(uv, 2, GLES20.GL_FLOAT, false, 0, uvBuf)
-        GLES20.glUniformMatrix4fv(GLES20.glGetUniformLocation(program, "uSTMatrix"), 1, false, stMatrix, 0)
-        GLES20.glUniform1f(
-            GLES20.glGetUniformLocation(program, "uTime"),
-            (System.nanoTime() - startTime) / 1_000_000_000f
-        )
-        GLES20.glUniform1f(
-            GLES20.glGetUniformLocation(program, "uEffect"),
-            if (effectOn) 1f else 0f
-        )
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(OES, texId)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uTex"), 0)
-        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-    }
+        val uMat = GLES20.glGetUniformLocation(program, "uSTMatrix")
+        val uOp = GLES20.glGetUniformLocation(program, "uOpacity")
+        val uTex = GLES20.glGetUniformLocation(program, "uTex")
 
-    override fun onFrameAvailable(st: SurfaceTexture?) {
-        frameAvailable = true
+        for (s in slots) {
+            val st = s.st ?: continue
+            if (s.frameAvailable) {
+                s.frameAvailable = false
+                st.updateTexImage()
+                st.getTransformMatrix(s.stMatrix)
+                s.hasFrame = true
+            }
+            if (!s.hasFrame || !s.visible) continue
+
+            var vx = 0
+            var vy = 0
+            var vw = surfaceW
+            var vh = surfaceH
+            if (s.videoW > 0 && s.videoH > 0) {
+                val videoAspect = s.videoW.toFloat() / s.videoH
+                val screenAspect = surfaceW.toFloat() / surfaceH
+                if (videoAspect > screenAspect) {
+                    vh = (surfaceW / videoAspect).toInt()
+                    vy = (surfaceH - vh) / 2
+                } else {
+                    vw = (surfaceH * videoAspect).toInt()
+                    vx = (surfaceW - vw) / 2
+                }
+            }
+            GLES20.glViewport(vx, vy, vw, vh)
+
+            GLES20.glEnableVertexAttribArray(pos)
+            GLES20.glVertexAttribPointer(pos, 2, GLES20.GL_FLOAT, false, 0, vertexBuf)
+            GLES20.glEnableVertexAttribArray(uv)
+            GLES20.glVertexAttribPointer(uv, 2, GLES20.GL_FLOAT, false, 0, uvBuf)
+            GLES20.glUniformMatrix4fv(uMat, 1, false, s.stMatrix, 0)
+            GLES20.glUniform1f(uOp, s.opacity)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(OES, s.texId)
+            GLES20.glUniform1i(uTex, 0)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        }
+        GLES20.glDisable(GLES20.GL_BLEND)
     }
 
     private fun seekExact(mp: MediaPlayer, ms: Long) {
@@ -166,62 +178,80 @@ class VideoRenderer(private val context: Context) :
     }
 
     // Returns false only when the GL surface is not ready yet
-    fun setVideo(uri: Uri, startMs: Long): Boolean {
-        val st = surfaceTexture ?: return false
+    fun setVideo(slot: Int, uri: Uri, startMs: Long): Boolean {
+        val s = slots[slot]
+        val sf = s.surface ?: return false
         try {
-            player?.release()
+            s.player?.release()
         } catch (e: Exception) {
         }
-        player = null
-        hasFrame = false
-        prepared = false
-        ended = false
-        videoW = 0
-        videoH = 0
-        targetMs = startMs
+        s.player = null
+        s.hasFrame = false
+        s.prepared = false
+        s.ended = false
+        s.videoW = 0
+        s.videoH = 0
+        s.targetMs = startMs
         val mp = MediaPlayer()
         try {
             mp.setDataSource(context, uri)
-            mp.setSurface(Surface(st))
+            mp.setSurface(sf)
             mp.isLooping = false
             mp.setOnVideoSizeChangedListener { _, w, h ->
-                videoW = w
-                videoH = h
+                s.videoW = w
+                s.videoH = h
             }
-            mp.setOnCompletionListener { ended = true }
+            mp.setOnCompletionListener { s.ended = true }
             mp.setOnPreparedListener { m ->
-                prepared = true
-                seekExact(m, targetMs)
-                if (wantPlay) m.start()
+                s.prepared = true
+                seekExact(m, s.targetMs)
+                if (s.wantPlay) m.start()
             }
             mp.prepareAsync()
-            player = mp
+            s.player = mp
         } catch (e: Exception) {
             try {
                 mp.release()
             } catch (e2: Exception) {
             }
-            player = null
+            s.player = null
         }
         return true
     }
 
-    fun isReady(): Boolean = player != null && prepared
+    fun setLayer(slot: Int, visible: Boolean, opacity: Float) {
+        val s = slots[slot]
+        s.visible = visible
+        s.opacity = opacity
+    }
 
-    fun seek(ms: Long) {
-        targetMs = ms
-        val p = player ?: return
-        if (!prepared) return
+    fun setOpacity(slot: Int, opacity: Float) {
+        slots[slot].opacity = opacity
+    }
+
+    fun isReady(slot: Int): Boolean {
+        val s = slots[slot]
+        return s.player != null && s.prepared
+    }
+
+    fun hasEnded(slot: Int): Boolean = slots[slot].ended
+
+    fun seek(slot: Int, ms: Long) {
+        val s = slots[slot]
+        s.targetMs = ms
+        val p = s.player ?: return
+        if (!s.prepared) return
         try {
-            ended = false
+            s.ended = false
             seekExact(p, ms)
         } catch (e: Exception) {
         }
     }
 
-    fun position(): Long {
-        val p = player ?: return 0L
-        if (!prepared) return 0L
+    fun position(slot: Int): Long {
+        val s = slots[slot]
+        val p = s.player ?: return 0L
+        if (!s.prepared) return 0L
         return try {
             p.currentPosition.toLong()
         } catch (e: Exception) {
@@ -229,34 +259,45 @@ class VideoRenderer(private val context: Context) :
         }
     }
 
-    fun play() {
-        wantPlay = true
-        val p = player ?: return
-        if (!prepared) return
+    fun play(slot: Int) {
+        val s = slots[slot]
+        s.wantPlay = true
+        val p = s.player ?: return
+        if (!s.prepared) return
         try {
-            ended = false
+            s.ended = false
             p.start()
         } catch (e: Exception) {
         }
     }
 
-    fun pause() {
-        wantPlay = false
-        val p = player ?: return
-        if (!prepared) return
+    fun pause(slot: Int) {
+        val s = slots[slot]
+        s.wantPlay = false
+        val p = s.player ?: return
+        if (!s.prepared) return
         try {
             if (p.isPlaying) p.pause()
         } catch (e: Exception) {
         }
     }
 
+    fun pauseAll() {
+        for (i in 0 until MAX_TRACKS) pause(i)
+    }
+
     fun release() {
-        try {
-            player?.release()
-        } catch (e: Exception) {
+        for (s in slots) {
+            try {
+                s.player?.release()
+            } catch (e: Exception) {
+            }
+            s.player = null
+            try {
+                s.st?.release()
+            } catch (e: Exception) {
+            }
         }
-        player = null
-        surfaceTexture?.release()
     }
 
     private fun buildProgram(vs: String, fs: String): Int {
