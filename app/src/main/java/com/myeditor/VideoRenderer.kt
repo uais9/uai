@@ -30,10 +30,13 @@ class VideoRenderer(private val context: Context) :
     private val stMatrix = FloatArray(16)
 
     @Volatile var effectOn = false
+    @Volatile var showVideo = true
+    @Volatile var ended = false
     @Volatile private var videoW = 0
     @Volatile private var videoH = 0
     @Volatile private var prepared = false
-    @Volatile var ended = false
+    @Volatile private var wantPlay = false
+    @Volatile private var targetMs = 0L
     private var surfaceW = 1
     private var surfaceH = 1
 
@@ -85,6 +88,7 @@ class VideoRenderer(private val context: Context) :
         GLES20.glTexParameteri(OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         Matrix.setIdentityM(stMatrix, 0)
+        hasFrame = false
         val st = SurfaceTexture(texId)
         st.setOnFrameAvailableListener(this)
         surfaceTexture = st
@@ -108,7 +112,7 @@ class VideoRenderer(private val context: Context) :
             st.getTransformMatrix(stMatrix)
             hasFrame = true
         }
-        if (!hasFrame) return
+        if (!hasFrame || !showVideo) return
 
         var vx = 0
         var vy = 0
@@ -161,33 +165,51 @@ class VideoRenderer(private val context: Context) :
         }
     }
 
-    fun setVideo(uri: Uri, startMs: Long = 0L) {
-        val st = surfaceTexture ?: return
-        player?.release()
+    // Returns false only when the GL surface is not ready yet
+    fun setVideo(uri: Uri, startMs: Long): Boolean {
+        val st = surfaceTexture ?: return false
+        try {
+            player?.release()
+        } catch (e: Exception) {
+        }
+        player = null
         hasFrame = false
         prepared = false
         ended = false
         videoW = 0
         videoH = 0
-        player = MediaPlayer().apply {
-            setDataSource(context, uri)
-            setSurface(Surface(st))
-            isLooping = false
-            setOnVideoSizeChangedListener { _, w, h ->
+        targetMs = startMs
+        val mp = MediaPlayer()
+        try {
+            mp.setDataSource(context, uri)
+            mp.setSurface(Surface(st))
+            mp.isLooping = false
+            mp.setOnVideoSizeChangedListener { _, w, h ->
                 videoW = w
                 videoH = h
             }
-            setOnCompletionListener { ended = true }
-            setOnPreparedListener { mp ->
+            mp.setOnCompletionListener { ended = true }
+            mp.setOnPreparedListener { m ->
                 prepared = true
-                seekExact(mp, startMs)
-                mp.start()
+                seekExact(m, targetMs)
+                if (wantPlay) m.start()
             }
-            prepareAsync()
+            mp.prepareAsync()
+            player = mp
+        } catch (e: Exception) {
+            try {
+                mp.release()
+            } catch (e2: Exception) {
+            }
+            player = null
         }
+        return true
     }
 
+    fun isReady(): Boolean = player != null && prepared
+
     fun seek(ms: Long) {
+        targetMs = ms
         val p = player ?: return
         if (!prepared) return
         try {
@@ -207,17 +229,8 @@ class VideoRenderer(private val context: Context) :
         }
     }
 
-    fun isPlaying(): Boolean {
-        val p = player ?: return false
-        if (!prepared) return false
-        return try {
-            p.isPlaying
-        } catch (e: Exception) {
-            false
-        }
-    }
-
     fun play() {
+        wantPlay = true
         val p = player ?: return
         if (!prepared) return
         try {
@@ -228,6 +241,7 @@ class VideoRenderer(private val context: Context) :
     }
 
     fun pause() {
+        wantPlay = false
         val p = player ?: return
         if (!prepared) return
         try {
@@ -237,7 +251,10 @@ class VideoRenderer(private val context: Context) :
     }
 
     fun release() {
-        player?.release()
+        try {
+            player?.release()
+        } catch (e: Exception) {
+        }
         player = null
         surfaceTexture?.release()
     }
