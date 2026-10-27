@@ -9,7 +9,8 @@ class Project(var name: String = "Untitled") {
 
     fun totalMs(): Long = clips.maxOfOrNull { it.endMs } ?: 0L
 
-    fun clipAt(t: Long): Clip? = clips.firstOrNull { t >= it.startMs && t < it.endMs }
+    fun clipOnTrack(t: Long, track: Int): Clip? =
+        clips.firstOrNull { it.track == track && t >= it.startMs && t < it.endMs }
 
     fun toJson(): String {
         val arr = JSONArray()
@@ -20,10 +21,12 @@ class Project(var name: String = "Untitled") {
                 put("startMs", c.startMs)
                 put("trimStartMs", c.trimStartMs)
                 put("trimEndMs", c.trimEndMs)
+                put("track", c.track)
+                put("opacity", c.opacity.toDouble())
             })
         }
         return JSONObject().apply {
-            put("version", 2)
+            put("version", 3)
             put("name", name)
             put("clips", arr)
         }.toString()
@@ -50,7 +53,9 @@ class Project(var name: String = "Untitled") {
                         c.getLong("durationMs"),
                         start,
                         c.getLong("trimStartMs"),
-                        c.getLong("trimEndMs")
+                        c.getLong("trimEndMs"),
+                        c.optInt("track", 0).coerceIn(0, MAX_TRACKS - 1),
+                        c.optDouble("opacity", 1.0).toFloat()
                     )
                     p.clips.add(clip)
                     cursor = clip.endMs
