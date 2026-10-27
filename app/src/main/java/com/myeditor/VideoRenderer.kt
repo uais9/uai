@@ -8,6 +8,7 @@ import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.opengl.Matrix
+import android.os.Build
 import android.view.Surface
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -27,6 +28,14 @@ class VideoRenderer(private val context: Context) :
     private var hasFrame = false
     private val startTime = System.nanoTime()
     private val stMatrix = FloatArray(16)
+
+    @Volatile var effectOn = false
+    @Volatile private var videoW = 0
+    @Volatile private var videoH = 0
+    @Volatile private var prepared = false
+    @Volatile var ended = false
+    private var surfaceW = 1
+    private var surfaceH = 1
 
     private val vertexBuf = floatBuf(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f))
     private val uvBuf = floatBuf(floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f))
@@ -52,11 +61,14 @@ class VideoRenderer(private val context: Context) :
         uniform samplerExternalOES uTex;
         uniform mat4 uSTMatrix;
         uniform float uTime;
+        uniform float uEffect;
         void main() {
             vec2 uv = vUv;
-            vec2 c = uv - 0.5;
-            float d = length(c);
-            uv += normalize(c + 0.0001) * 0.02 * sin(d * 40.0 - uTime * 4.0);
+            if (uEffect > 0.5) {
+                vec2 c = uv - 0.5;
+                float d = length(c);
+                uv += normalize(c + 0.0001) * 0.02 * sin(d * 40.0 - uTime * 4.0);
+            }
             vec2 t = (uSTMatrix * vec4(uv, 0.0, 1.0)).xy;
             gl_FragColor = texture2D(uTex, t);
         }
@@ -80,10 +92,13 @@ class VideoRenderer(private val context: Context) :
     }
 
     override fun onSurfaceChanged(gl: GL10?, width: Int, height: Int) {
+        surfaceW = width
+        surfaceH = height
         GLES20.glViewport(0, 0, width, height)
     }
 
     override fun onDrawFrame(gl: GL10?) {
+        GLES20.glViewport(0, 0, surfaceW, surfaceH)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         val st = surfaceTexture ?: return
@@ -94,6 +109,23 @@ class VideoRenderer(private val context: Context) :
             hasFrame = true
         }
         if (!hasFrame) return
+
+        var vx = 0
+        var vy = 0
+        var vw = surfaceW
+        var vh = surfaceH
+        if (videoW > 0 && videoH > 0) {
+            val videoAspect = videoW.toFloat() / videoH
+            val screenAspect = surfaceW.toFloat() / surfaceH
+            if (videoAspect > screenAspect) {
+                vh = (surfaceW / videoAspect).toInt()
+                vy = (surfaceH - vh) / 2
+            } else {
+                vw = (surfaceH * videoAspect).toInt()
+                vx = (surfaceW - vw) / 2
+            }
+        }
+        GLES20.glViewport(vx, vy, vw, vh)
 
         GLES20.glUseProgram(program)
         val pos = GLES20.glGetAttribLocation(program, "aPosition")
@@ -107,6 +139,10 @@ class VideoRenderer(private val context: Context) :
             GLES20.glGetUniformLocation(program, "uTime"),
             (System.nanoTime() - startTime) / 1_000_000_000f
         )
+        GLES20.glUniform1f(
+            GLES20.glGetUniformLocation(program, "uEffect"),
+            if (effectOn) 1f else 0f
+        )
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(OES, texId)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uTex"), 0)
@@ -117,16 +153,86 @@ class VideoRenderer(private val context: Context) :
         frameAvailable = true
     }
 
-    fun setVideo(uri: Uri) {
+    private fun seekExact(mp: MediaPlayer, ms: Long) {
+        if (Build.VERSION.SDK_INT >= 26) {
+            mp.seekTo(ms, MediaPlayer.SEEK_CLOSEST)
+        } else {
+            mp.seekTo(ms.toInt())
+        }
+    }
+
+    fun setVideo(uri: Uri, startMs: Long = 0L) {
         val st = surfaceTexture ?: return
         player?.release()
         hasFrame = false
+        prepared = false
+        ended = false
+        videoW = 0
+        videoH = 0
         player = MediaPlayer().apply {
             setDataSource(context, uri)
             setSurface(Surface(st))
-            isLooping = true
-            setOnPreparedListener { it.start() }
+            isLooping = false
+            setOnVideoSizeChangedListener { _, w, h ->
+                videoW = w
+                videoH = h
+            }
+            setOnCompletionListener { ended = true }
+            setOnPreparedListener { mp ->
+                prepared = true
+                seekExact(mp, startMs)
+                mp.start()
+            }
             prepareAsync()
+        }
+    }
+
+    fun seek(ms: Long) {
+        val p = player ?: return
+        if (!prepared) return
+        try {
+            ended = false
+            seekExact(p, ms)
+        } catch (e: Exception) {
+        }
+    }
+
+    fun position(): Long {
+        val p = player ?: return 0L
+        if (!prepared) return 0L
+        return try {
+            p.currentPosition.toLong()
+        } catch (e: Exception) {
+            0L
+        }
+    }
+
+    fun isPlaying(): Boolean {
+        val p = player ?: return false
+        if (!prepared) return false
+        return try {
+            p.isPlaying
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    fun play() {
+        val p = player ?: return
+        if (!prepared) return
+        try {
+            ended = false
+            p.start()
+        } catch (e: Exception) {
+        }
+    }
+
+    fun pause() {
+        val p = player ?: return
+        if (!prepared) return
+        try {
+            if (p.isPlaying) p.pause()
+        } catch (e: Exception) {
         }
     }
 
