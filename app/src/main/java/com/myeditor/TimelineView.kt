@@ -22,17 +22,23 @@ class TimelineView(context: Context) : View(context) {
     var onScrub: ((Long) -> Unit)? = null
     var onSelect: ((Int) -> Unit)? = null
     var onMoveClip: ((Int, Long) -> Unit)? = null
+    var onTrimClip: ((Int, Int, Long) -> Unit)? = null
+    var clampTrim: ((Int, Int, Long) -> Long)? = null
 
     private val density = resources.displayMetrics.density
     private var pxPerSec = 80f * density
     private var movingIndex = -1
     private var moveDeltaMs = 0L
+    private var trimIndex = -1
+    private var trimEdge = 0
+    private var trimDeltaMs = 0L
     private var downX = 0f
     private var lastX = 0f
     private var touchMoved = false
     private val slop = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
     private val rect = RectF()
     private val tile = RectF()
+    private val handleRect = RectF()
 
     private val tickPaint = Paint().apply {
         color = Color.GRAY
@@ -55,6 +61,10 @@ class TimelineView(context: Context) : View(context) {
         strokeWidth = 2f * density
         isAntiAlias = true
     }
+    private val handlePaint = Paint().apply {
+        color = Color.WHITE
+        isAntiAlias = true
+    }
     private val textPaint = Paint().apply {
         color = Color.WHITE
         textSize = 11f * density
@@ -74,7 +84,7 @@ class TimelineView(context: Context) : View(context) {
     )
 
     private val longPress = Runnable {
-        if (!touchMoved && !scaleDetector.isInProgress) {
+        if (!touchMoved && !scaleDetector.isInProgress && trimIndex < 0) {
             val i = hit(downX)
             if (i >= 0) {
                 movingIndex = i
@@ -95,6 +105,21 @@ class TimelineView(context: Context) : View(context) {
             if (t >= c.startMs && t < c.endMs) return i
         }
         return -1
+    }
+
+    // 1 = left edge, 2 = right edge, 0 = none (only for the selected clip)
+    private fun hitEdge(x: Float): Int {
+        val c = clips.getOrNull(selectedIndex) ?: return 0
+        val k = pxPerMs()
+        val cx = width / 2f
+        val left = cx + (c.startMs - playheadMs) * k
+        val right = left + c.trimmedMs * k
+        val zone = maxOf(14f * density, minOf(24f * density, (right - left) / 3f))
+        val dl = abs(x - left)
+        val dr = abs(x - right)
+        if (dl <= zone && dl <= dr) return 1
+        if (dr <= zone) return 2
+        return 0
     }
 
     private fun stepMs(): Long {
@@ -141,9 +166,18 @@ class TimelineView(context: Context) : View(context) {
         for (i in clips.indices) {
             val c = clips[i]
             var start = c.startMs
+            var len = c.trimmedMs
             if (i == movingIndex) start += moveDeltaMs
+            if (i == trimIndex) {
+                if (trimEdge == 1) {
+                    start += trimDeltaMs
+                    len -= trimDeltaMs
+                } else {
+                    len += trimDeltaMs
+                }
+            }
             val left = cx + (start - playheadMs) * k
-            val right = left + c.trimmedMs * k
+            val right = left + len * k
             if (right < 0f || left > w) continue
             rect.set(left, top, right, bottom)
 
@@ -169,7 +203,7 @@ class TimelineView(context: Context) : View(context) {
             if (right - left > 40f * density) {
                 val tx = maxOf(left, 0f) + 4f * density
                 canvas.drawText(
-                    "%.1fs".format(c.trimmedMs / 1000f),
+                    "%.1fs".format(len / 1000f),
                     tx,
                     top + 14f * density,
                     textPaint
@@ -183,6 +217,16 @@ class TimelineView(context: Context) : View(context) {
             } else if (i == selectedIndex) {
                 borderPaint.color = Color.parseColor("#5C8DFF")
                 canvas.drawRect(rect, borderPaint)
+            }
+
+            if (i == selectedIndex && movingIndex < 0) {
+                val hw = 7f * density
+                val hh = (bottom - top) * 0.6f
+                val mid = (top + bottom) / 2f
+                handleRect.set(left, mid - hh / 2f, left + hw, mid + hh / 2f)
+                canvas.drawRoundRect(handleRect, 3f * density, 3f * density, handlePaint)
+                handleRect.set(right - hw, mid - hh / 2f, right, mid + hh / 2f)
+                canvas.drawRoundRect(handleRect, 3f * density, 3f * density, handlePaint)
             }
         }
 
@@ -199,12 +243,24 @@ class TimelineView(context: Context) : View(context) {
                 touchMoved = false
                 movingIndex = -1
                 moveDeltaMs = 0L
-                postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
+                trimIndex = -1
+                trimEdge = 0
+                trimDeltaMs = 0L
+                val edge = hitEdge(e.x)
+                if (edge != 0) {
+                    trimIndex = selectedIndex
+                    trimEdge = edge
+                } else {
+                    postDelayed(longPress, ViewConfiguration.getLongPressTimeout().toLong())
+                }
             }
             MotionEvent.ACTION_POINTER_DOWN -> {
                 touchMoved = true
                 removeCallbacks(longPress)
+                trimIndex = -1
+                trimDeltaMs = 0L
                 lastX = e.x
+                invalidate()
             }
             MotionEvent.ACTION_POINTER_UP -> {
                 val idx = if (e.actionIndex == 0) 1 else 0
@@ -217,7 +273,11 @@ class TimelineView(context: Context) : View(context) {
                     lastX = e.x
                 } else {
                     if (abs(e.x - downX) > slop) touchMoved = true
-                    if (movingIndex >= 0) {
+                    if (trimIndex >= 0) {
+                        val raw = ((e.x - downX) / pxPerMs()).toLong()
+                        trimDeltaMs = clampTrim?.invoke(trimIndex, trimEdge, raw) ?: raw
+                        invalidate()
+                    } else if (movingIndex >= 0) {
                         moveDeltaMs = ((e.x - downX) / pxPerMs()).toLong()
                         invalidate()
                     } else if (touchMoved) {
@@ -231,7 +291,16 @@ class TimelineView(context: Context) : View(context) {
             }
             MotionEvent.ACTION_UP -> {
                 removeCallbacks(longPress)
-                if (movingIndex >= 0) {
+                if (trimIndex >= 0) {
+                    val i = trimIndex
+                    val ed = trimEdge
+                    val d = trimDeltaMs
+                    trimIndex = -1
+                    trimEdge = 0
+                    trimDeltaMs = 0L
+                    onTrimClip?.invoke(i, ed, d)
+                    invalidate()
+                } else if (movingIndex >= 0) {
                     val i = movingIndex
                     val c = clips.getOrNull(i)
                     val d = moveDeltaMs
@@ -247,6 +316,9 @@ class TimelineView(context: Context) : View(context) {
                 removeCallbacks(longPress)
                 movingIndex = -1
                 moveDeltaMs = 0L
+                trimIndex = -1
+                trimEdge = 0
+                trimDeltaMs = 0L
                 invalidate()
             }
         }
