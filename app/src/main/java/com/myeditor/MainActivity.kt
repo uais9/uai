@@ -20,7 +20,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import androidx.media3.common.Effects
+import androidx.media3.transformer.Effects
 import androidx.media3.common.MediaItem
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.Presentation
@@ -602,4 +602,65 @@ class MainActivity : Activity() {
     // ---------- UI refresh ----------
 
     private fun loadThumb(uriStr: String) {
-        if (thumb
+                if (thumbs.containsKey(uriStr) || loading.contains(uriStr)) return
+        loading.add(uriStr)
+        thread {
+            try {
+                val r = MediaMetadataRetriever()
+                r.setDataSource(this, Uri.parse(uriStr))
+                val frame = r.getFrameAtTime(0)
+                r.release()
+                if (frame != null) {
+                    val h = 160
+                    val w = (frame.width * h.toFloat() / frame.height).toInt().coerceAtLeast(1)
+                    val bmp = Bitmap.createScaledBitmap(frame, w, h, true)
+                    runOnUiThread {
+                        thumbs[uriStr] = bmp
+                        timeline.invalidate()
+                    }
+                }
+            } catch (e: Exception) {
+            }
+        }
+    }
+
+    private fun updateInfo() {
+        val sel = project.clips.getOrNull(selected)
+        var s = "${fmt(playheadMs)} / ${fmt(project.totalMs())}   |   ${project.clips.size} clips"
+        if (sel != null) {
+            s += "\nSelected: starts ${fmt(sel.startMs)}, length ${fmt(sel.trimmedMs)}"
+        }
+        info.text = s
+    }
+
+    private fun refresh() {
+        timeline.totalMs = project.totalMs()
+        timeline.selectedIndex = selected
+        for (c in project.clips) loadThumb(c.uri)
+        setPlayhead(playheadMs)
+    }
+
+    // ---------- lifecycle ----------
+
+    override fun onPause() {
+        super.onPause()
+        handler.removeCallbacks(ticker)
+        stopPlayback()
+        glView.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        glView.onResume()
+        loadedClip = null
+        needShow = true
+        lastTickAt = SystemClock.elapsedRealtime()
+        handler.post(ticker)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        transformer?.cancel()
+        renderer.release()
+    }
+}
