@@ -1,40 +1,24 @@
 package com.myeditor
 
 import android.app.Activity
-import android.content.ContentValues
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.opengl.GLSurfaceView
-import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.provider.MediaStore
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
-import androidx.media3.transformer.Effects
-import androidx.media3.common.MediaItem
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.effect.Presentation
-import androidx.media3.transformer.Composition
-import androidx.media3.transformer.EditedMediaItem
-import androidx.media3.transformer.EditedMediaItemSequence
-import androidx.media3.transformer.ExportException
-import androidx.media3.transformer.ExportResult
-import androidx.media3.transformer.ProgressHolder
-import androidx.media3.transformer.Transformer
 import java.io.File
 import kotlin.concurrent.thread
 
-@OptIn(UnstableApi::class)
 class MainActivity : Activity() {
     private lateinit var glView: GLSurfaceView
     private lateinit var renderer: VideoRenderer
@@ -43,6 +27,7 @@ class MainActivity : Activity() {
     private lateinit var timeline: TimelineView
     private lateinit var info: TextView
     private lateinit var playBtn: Button
+    private lateinit var exporter: Exporter
 
     private var selected = -1
     private var playheadMs = 0L
@@ -52,9 +37,8 @@ class MainActivity : Activity() {
     private var lastSeekAt = 0L
     private var needShow = true
 
-    private var exporting = false
-    private var transformer: Transformer? = null
-    private val progressHolder = ProgressHolder()
+    private val undoStack = ArrayList<List<Clip>>()
+    private val redoStack = ArrayList<List<Clip>>()
 
     private val thumbs = HashMap<String, Bitmap>()
     private val loading = HashSet<String>()
@@ -82,6 +66,9 @@ class MainActivity : Activity() {
             this.text = text
             textSize = 12f
             isAllCaps = false
+            minWidth = 0
+            minimumWidth = 0
+            setPadding(dp(2), 0, dp(2), 0)
             setOnClickListener { onClick() }
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
@@ -91,6 +78,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         projectFile = File(filesDir, "project.json")
         project = Project.load(projectFile)
+        exporter = Exporter(this)
 
         renderer = VideoRenderer(this)
         glView = GLSurfaceView(this).apply {
@@ -110,6 +98,8 @@ class MainActivity : Activity() {
             onScrub = { ms -> scrubTo(ms) }
             onSelect = { i -> selectClip(i) }
             onMoveClip = { i, s -> moveClip(i, s) }
+            onTrimClip = { i, edge, d -> trimClip(i, edge, d) }
+            clampTrim = { i, edge, raw -> clampTrimDelta(i, edge, raw) }
         }
 
         playBtn = small("Play") { togglePlay() }
@@ -122,8 +112,10 @@ class MainActivity : Activity() {
         }
         val bottom = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            addView(small("Add clips") { pickClips() })
+            addView(small("Undo") { undo() })
+            addView(small("Redo") { redo() })
             addView(small("Remove") { removeSelected() })
+            addView(small("Add") { pickClips() })
             addView(small("Export") { startExport() })
         }
 
@@ -143,160 +135,21 @@ class MainActivity : Activity() {
 
     // ---------- export ----------
 
-    private fun outputSize(first: Clip): Pair<Int, Int> {
-        var w = 1280
-        var h = 720
-        try {
-            val r = MediaMetadataRetriever()
-            r.setDataSource(this, Uri.parse(first.uri))
-            val vw = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)
-                ?.toIntOrNull() ?: 0
-            val vh = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)
-                ?.toIntOrNull() ?: 0
-            val rot = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
-                ?.toIntOrNull() ?: 0
-            r.release()
-            var dw = vw
-            var dh = vh
-            if (rot == 90 || rot == 270) {
-                dw = vh
-                dh = vw
-            }
-            if (dw > 0 && dh > 0) {
-                val longSide = maxOf(dw, dh)
-                val scale = if (longSide > 1920) 1920f / longSide else 1f
-                w = ((dw * scale).toInt() / 2) * 2
-                h = ((dh * scale).toInt() / 2) * 2
-            }
-        } catch (e: Exception) {
-        }
-        return Pair(w, h)
-    }
-
     private fun startExport() {
-        if (exporting) {
+        if (exporter.running) {
             toast("Export already running")
             return
         }
-        val sorted = project.clips.sortedBy { it.startMs }
-        if (sorted.isEmpty()) {
+        if (project.clips.isEmpty()) {
             toast("Add clips first")
             return
         }
         stopPlayback()
-        val (w, h) = outputSize(sorted[0])
-
-        val seq = EditedMediaItemSequence.Builder(emptyList<EditedMediaItem>())
-        var cursor = 0L
-        for (c in sorted) {
-            if (c.startMs > cursor) {
-                seq.addGap((c.startMs - cursor) * 1000L)
-            }
-            val clipping = MediaItem.ClippingConfiguration.Builder()
-                .setStartPositionMs(c.trimStartMs)
-                .setEndPositionMs(c.trimEndMs)
-                .build()
-            val mediaItem = MediaItem.Builder()
-                .setUri(Uri.parse(c.uri))
-                .setClippingConfiguration(clipping)
-                .build()
-            seq.addItem(EditedMediaItem.Builder(mediaItem).build())
-            cursor = c.endMs
+        exporter.start(project.clips.toList()) { msg, ok ->
+            Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
+            if (ok) updateInfo() else info.text = msg
         }
-        seq.experimentalSetForceVideoTrack(true)
-        seq.experimentalSetForceAudioTrack(true)
-
-        val composition = Composition.Builder(seq.build())
-            .setEffects(
-                Effects(
-                    emptyList(),
-                    listOf(
-                        Presentation.createForWidthAndHeight(
-                            w, h, Presentation.LAYOUT_SCALE_TO_FIT
-                        )
-                    )
-                )
-            )
-            .build()
-
-        val out = File(cacheDir, "export_" + System.currentTimeMillis() + ".mp4")
-        if (out.exists()) out.delete()
-
-        val t = Transformer.Builder(this)
-            .addListener(object : Transformer.Listener {
-                override fun onCompleted(composition: Composition, exportResult: ExportResult) {
-                    finishExport(out)
-                }
-
-                override fun onError(
-                    composition: Composition,
-                    exportResult: ExportResult,
-                    exportException: ExportException
-                ) {
-                    failExport(exportException)
-                }
-            })
-            .build()
-        transformer = t
-        exporting = true
-        info.text = "Exporting..."
-        t.start(composition, out.absolutePath)
-    }
-
-    private fun finishExport(file: File) {
-        exporting = false
-        transformer = null
-        info.text = "Saving to gallery..."
-        thread {
-            val where = try {
-                saveToGallery(file)
-            } catch (e: Exception) {
-                ""
-            }
-            file.delete()
-            runOnUiThread {
-                if (where.isEmpty()) {
-                    Toast.makeText(this, "Export finished but saving failed", Toast.LENGTH_LONG).show()
-                } else {
-                    Toast.makeText(this, "Saved to $where", Toast.LENGTH_LONG).show()
-                }
-                updateInfo()
-            }
-        }
-    }
-
-    private fun failExport(e: ExportException) {
-        exporting = false
-        transformer = null
-        val msg = "Export failed (code ${e.errorCode}): ${e.message}"
-        info.text = msg
-        Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
-    }
-
-    private fun saveToGallery(src: File): String {
-        val name = "MyEditor_" + System.currentTimeMillis() + ".mp4"
-        if (Build.VERSION.SDK_INT >= 29) {
-            val values = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, name)
-                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/MyEditor")
-                put(MediaStore.Video.Media.IS_PENDING, 1)
-            }
-            val uri = contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                ?: return ""
-            contentResolver.openOutputStream(uri)?.use { out ->
-                src.inputStream().use { it.copyTo(out) }
-            }
-            values.clear()
-            values.put(MediaStore.Video.Media.IS_PENDING, 0)
-            contentResolver.update(uri, values, null, null)
-            return "Movies/MyEditor (open your Gallery)"
-        } else {
-            val dir = getExternalFilesDir(Environment.DIRECTORY_MOVIES) ?: filesDir
-            val dest = File(dir, name)
-            src.copyTo(dest, true)
-            return dest.absolutePath
-        }
+        if (exporter.running) info.text = "Exporting..."
     }
 
     // ---------- playback ----------
@@ -331,16 +184,8 @@ class MainActivity : Activity() {
         val dt = now - lastTickAt
         lastTickAt = now
 
-        if (exporting) {
-            val tr = transformer
-            if (tr != null) {
-                val state = tr.getProgress(progressHolder)
-                if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
-                    info.text = "Exporting... ${progressHolder.progress}%  (keep the app open)"
-                } else {
-                    info.text = "Exporting..."
-                }
-            }
+        if (exporter.running) {
+            info.text = exporter.progressText()
             return
         }
 
@@ -405,7 +250,7 @@ class MainActivity : Activity() {
     }
 
     private fun togglePlay() {
-        if (exporting) return
+        if (exporter.running) return
         if (playing) {
             stopPlayback()
             return
@@ -428,7 +273,7 @@ class MainActivity : Activity() {
         playheadMs = ms.coerceIn(0L, project.totalMs())
         timeline.playheadMs = playheadMs
         timeline.invalidate()
-        if (!exporting) updateInfo()
+        if (!exporter.running) updateInfo()
     }
 
     private fun scrubTo(ms: Long) {
@@ -443,13 +288,46 @@ class MainActivity : Activity() {
         }
     }
 
+    // ---------- undo / redo ----------
+
+    private fun pushUndo() {
+        undoStack.add(project.clips.toList())
+        if (undoStack.size > 50) undoStack.removeAt(0)
+        redoStack.clear()
+    }
+
+    private fun undo() {
+        if (undoStack.isEmpty()) {
+            toast("Nothing to undo")
+            return
+        }
+        redoStack.add(project.clips.toList())
+        restore(undoStack.removeAt(undoStack.size - 1))
+    }
+
+    private fun redo() {
+        if (redoStack.isEmpty()) {
+            toast("Nothing to redo")
+            return
+        }
+        undoStack.add(project.clips.toList())
+        restore(redoStack.removeAt(redoStack.size - 1))
+    }
+
+    private fun restore(list: List<Clip>) {
+        project.clips.clear()
+        project.clips.addAll(list)
+        if (selected >= project.clips.size) selected = -1
+        afterEdit()
+    }
+
     // ---------- editing ----------
 
     private fun selectClip(i: Int) {
         selected = i
         timeline.selectedIndex = i
         timeline.invalidate()
-        if (!exporting) updateInfo()
+        if (!exporter.running) updateInfo()
     }
 
     private fun afterEdit() {
@@ -471,6 +349,7 @@ class MainActivity : Activity() {
             toast("Move the playhead inside the clip")
             return
         }
+        pushUndo()
         val p = clip.trimStartMs + (t - clip.startMs)
         project.clips[selected] = clip.copy(trimEndMs = p)
         project.clips.add(selected + 1, clip.copy(startMs = t, trimStartMs = p))
@@ -488,6 +367,7 @@ class MainActivity : Activity() {
             toast("Put the playhead inside the clip")
             return
         }
+        pushUndo()
         val p = clip.trimStartMs + (t - clip.startMs)
         project.clips[selected] = clip.copy(startMs = t, trimStartMs = p)
         afterEdit()
@@ -504,8 +384,52 @@ class MainActivity : Activity() {
             toast("Put the playhead inside the clip")
             return
         }
+        pushUndo()
         val p = clip.trimStartMs + (t - clip.startMs)
         project.clips[selected] = clip.copy(trimEndMs = p)
+        afterEdit()
+    }
+
+    private fun clampTrimDelta(i: Int, edge: Int, raw: Long): Long {
+        val clip = project.clips.getOrNull(i) ?: return 0L
+        val minD: Long
+        val maxD: Long
+        if (edge == 1) {
+            var prevEnd = 0L
+            for ((j, o) in project.clips.withIndex()) {
+                if (j != i && o.endMs <= clip.startMs && o.endMs > prevEnd) prevEnd = o.endMs
+            }
+            minD = maxOf(-clip.trimStartMs, prevEnd - clip.startMs)
+            maxD = clip.trimmedMs - 300L
+        } else {
+            var nextStart = Long.MAX_VALUE
+            for ((j, o) in project.clips.withIndex()) {
+                if (j != i && o.startMs >= clip.endMs && o.startMs < nextStart) nextStart = o.startMs
+            }
+            val room = clip.durationMs - clip.trimEndMs
+            maxD = if (nextStart == Long.MAX_VALUE) room else minOf(room, nextStart - clip.endMs)
+            minD = 300L - clip.trimmedMs
+        }
+        if (minD > maxD) return 0L
+        return raw.coerceIn(minD, maxD)
+    }
+
+    private fun trimClip(i: Int, edge: Int, rawDelta: Long) {
+        val clip = project.clips.getOrNull(i) ?: return
+        val d = clampTrimDelta(i, edge, rawDelta)
+        if (d == 0L) {
+            timeline.invalidate()
+            return
+        }
+        pushUndo()
+        if (edge == 1) {
+            project.clips[i] = clip.copy(
+                startMs = clip.startMs + d,
+                trimStartMs = clip.trimStartMs + d
+            )
+        } else {
+            project.clips[i] = clip.copy(trimEndMs = clip.trimEndMs + d)
+        }
         afterEdit()
     }
 
@@ -514,6 +438,7 @@ class MainActivity : Activity() {
             toast("Tap a clip first")
             return
         }
+        pushUndo()
         project.clips.removeAt(selected)
         selected = -1
         timeline.selectedIndex = -1
@@ -531,6 +456,11 @@ class MainActivity : Activity() {
                 return
             }
         }
+        if (s == clip.startMs) {
+            timeline.invalidate()
+            return
+        }
+        pushUndo()
         project.clips[i] = clip.copy(startMs = s)
         afterEdit()
     }
@@ -571,6 +501,7 @@ class MainActivity : Activity() {
                 }
             }
             runOnUiThread {
+                if (added.isNotEmpty()) pushUndo()
                 var cursor = project.totalMs()
                 for (c in added) {
                     project.clips.add(c.copy(startMs = cursor))
@@ -602,7 +533,7 @@ class MainActivity : Activity() {
     // ---------- UI refresh ----------
 
     private fun loadThumb(uriStr: String) {
-                if (thumbs.containsKey(uriStr) || loading.contains(uriStr)) return
+        if (thumbs.containsKey(uriStr) || loading.contains(uriStr)) return
         loading.add(uriStr)
         thread {
             try {
@@ -660,7 +591,7 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        transformer?.cancel()
+        exporter.cancel()
         renderer.release()
     }
 }
