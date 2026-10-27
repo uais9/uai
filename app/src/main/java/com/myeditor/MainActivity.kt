@@ -132,9 +132,15 @@ class MainActivity : Activity() {
         }
         val pos = clip.trimStartMs + (t - clip.startMs)
         renderer.showVideo = true
-        if (loadedClip !== clip) {
-            if (!renderer.setVideo(Uri.parse(clip.uri), pos)) return false
-            loadedClip = clip
+        val prev = loadedClip
+        if (prev !== clip) {
+            if (prev != null && prev.uri == clip.uri && renderer.isReady()) {
+                renderer.seek(pos)
+                loadedClip = clip
+            } else {
+                if (!renderer.setVideo(Uri.parse(clip.uri), pos)) return false
+                loadedClip = clip
+            }
         } else {
             renderer.seek(pos)
         }
@@ -168,11 +174,23 @@ class MainActivity : Activity() {
             t += dt
         } else {
             renderer.showVideo = true
-            if (loadedClip !== clip) {
-                val pos = clip.trimStartMs + (t - clip.startMs)
-                renderer.play()
-                if (renderer.setVideo(Uri.parse(clip.uri), pos)) loadedClip = clip
-                t += dt
+            val prev = loadedClip
+            if (prev !== clip) {
+                if (prev != null && prev.uri == clip.uri && renderer.isReady()) {
+                    // Same video file: keep the player running, no reload
+                    val contiguous = clip.trimStartMs == prev.trimEndMs &&
+                        clip.startMs == prev.endMs
+                    if (!contiguous) {
+                        renderer.seek(clip.trimStartMs + (t - clip.startMs))
+                    }
+                    renderer.play()
+                    loadedClip = clip
+                } else {
+                    val pos = clip.trimStartMs + (t - clip.startMs)
+                    renderer.play()
+                    if (renderer.setVideo(Uri.parse(clip.uri), pos)) loadedClip = clip
+                    t += dt
+                }
             } else if (renderer.isReady()) {
                 val pos = renderer.position()
                 if (renderer.ended || pos >= clip.trimEndMs - 30) {
