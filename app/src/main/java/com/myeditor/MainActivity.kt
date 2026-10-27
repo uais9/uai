@@ -32,7 +32,7 @@ class MainActivity : Activity() {
     private var selected = -1
     private var playheadMs = 0L
     private var playing = false
-    private var loadedClip: Clip? = null
+    private val loaded = arrayOfNulls<Clip>(MAX_TRACKS)
     private var lastTickAt = 0L
     private var lastSeekAt = 0L
     private var needShow = true
@@ -97,7 +97,7 @@ class MainActivity : Activity() {
             thumbs = this@MainActivity.thumbs
             onScrub = { ms -> scrubTo(ms) }
             onSelect = { i -> selectClip(i) }
-            onMoveClip = { i, s -> moveClip(i, s) }
+            onMoveClip = { i, s, tr -> moveClip(i, s, tr) }
             onTrimClip = { i, edge, d -> trimClip(i, edge, d) }
             clampTrim = { i, edge, raw -> clampTrimDelta(i, edge, raw) }
         }
@@ -154,29 +154,44 @@ class MainActivity : Activity() {
 
     // ---------- playback ----------
 
-    private fun showFrameAt(t: Long): Boolean {
-        val clip = project.clipAt(t)
+    // Makes one track (renderer slot) show the right clip for time t.
+    // Returns false only when the GL surface is not ready yet.
+    private fun syncTrack(track: Int, t: Long, isPlaying: Boolean): Boolean {
+        val clip = project.clipOnTrack(t, track)
         if (clip == null) {
-            renderer.showVideo = false
-            renderer.pause()
-            loadedClip = null
+            renderer.setLayer(track, false, 1f)
+            renderer.pause(track)
+            loaded[track] = null
             return true
         }
+        renderer.setLayer(track, true, clip.opacity)
         val pos = clip.trimStartMs + (t - clip.startMs)
-        renderer.showVideo = true
-        val prev = loadedClip
+        val prev = loaded[track]
         if (prev !== clip) {
-            if (prev != null && prev.uri == clip.uri && renderer.isReady()) {
-                renderer.seek(pos)
-                loadedClip = clip
+            if (prev != null && prev.uri == clip.uri && renderer.isReady(track)) {
+                val contiguous = clip.trimStartMs == prev.trimEndMs &&
+                    clip.startMs == prev.endMs
+                if (!isPlaying || !contiguous) {
+                    renderer.seek(track, pos)
+                }
+                loaded[track] = clip
             } else {
-                if (!renderer.setVideo(Uri.parse(clip.uri), pos)) return false
-                loadedClip = clip
+                if (!renderer.setVideo(track, Uri.parse(clip.uri), pos)) return false
+                loaded[track] = clip
             }
-        } else {
-            renderer.seek(pos)
+            if (isPlaying) renderer.play(track) else renderer.pause(track)
+        } else if (!isPlaying) {
+            renderer.seek(track, pos)
         }
         return true
+    }
+
+    private fun showFrameAt(t: Long): Boolean {
+        var ok = true
+        for (tr in 0 until MAX_TRACKS) {
+            if (!syncTrack(tr, t, false)) ok = false
+        }
+        return ok
     }
 
     private fun tick() {
@@ -203,42 +218,32 @@ class MainActivity : Activity() {
         }
 
         var t = playheadMs
-        val clip = project.clipAt(t)
-        if (clip == null) {
-            renderer.showVideo = false
-            renderer.pause()
-            loadedClip = null
+        var master: Clip? = null
+        var masterTrack = -1
+        for (tr in 0 until MAX_TRACKS) {
+            syncTrack(tr, t, true)
+            if (master == null) {
+                val c = project.clipOnTrack(t, tr)
+                if (c != null && loaded[tr] === c) {
+                    master = c
+                    masterTrack = tr
+                }
+            }
+        }
+
+        if (master == null) {
             t += dt
-        } else {
-            renderer.showVideo = true
-            val prev = loadedClip
-            if (prev !== clip) {
-                if (prev != null && prev.uri == clip.uri && renderer.isReady()) {
-                    val contiguous = clip.trimStartMs == prev.trimEndMs &&
-                        clip.startMs == prev.endMs
-                    if (!contiguous) {
-                        renderer.seek(clip.trimStartMs + (t - clip.startMs))
-                    }
-                    renderer.play()
-                    loadedClip = clip
-                } else {
-                    val pos = clip.trimStartMs + (t - clip.startMs)
-                    renderer.play()
-                    if (renderer.setVideo(Uri.parse(clip.uri), pos)) loadedClip = clip
-                    t += dt
-                }
-            } else if (renderer.isReady()) {
-                val pos = renderer.position()
-                if (renderer.ended || pos >= clip.trimEndMs - 30) {
-                    t = clip.endMs
-                } else if (pos >= clip.trimStartMs - 50) {
-                    t = maxOf(t, clip.startMs + (pos - clip.trimStartMs))
-                } else {
-                    t += dt
-                }
+        } else if (renderer.isReady(masterTrack)) {
+            val pos = renderer.position(masterTrack)
+            if (renderer.hasEnded(masterTrack) || pos >= master.trimEndMs - 30) {
+                t = master.endMs
+            } else if (pos >= master.trimStartMs - 50) {
+                t = maxOf(t, master.startMs + (pos - master.trimStartMs))
             } else {
                 t += dt
             }
+        } else {
+            t += dt
         }
 
         if (t >= total) {
@@ -258,14 +263,16 @@ class MainActivity : Activity() {
         if (project.clips.isEmpty()) return
         if (playheadMs >= project.totalMs()) setPlayhead(0L)
         showFrameAt(playheadMs)
-        renderer.play()
+        for (tr in 0 until MAX_TRACKS) {
+            if (project.clipOnTrack(playheadMs, tr) != null) renderer.play(tr)
+        }
         lastTickAt = SystemClock.elapsedRealtime()
         playing = true
     }
 
     private fun stopPlayback() {
         playing = false
-        renderer.pause()
+        renderer.pauseAll()
         playBtn.text = "Play"
     }
 
@@ -332,7 +339,7 @@ class MainActivity : Activity() {
 
     private fun afterEdit() {
         stopPlayback()
-        loadedClip = null
+        loaded.fill(null)
         needShow = true
         project.save(projectFile)
         refresh()
@@ -390,6 +397,7 @@ class MainActivity : Activity() {
         afterEdit()
     }
 
+    // Neighbours only count when they are on the same track.
     private fun clampTrimDelta(i: Int, edge: Int, raw: Long): Long {
         val clip = project.clips.getOrNull(i) ?: return 0L
         val minD: Long
@@ -397,14 +405,18 @@ class MainActivity : Activity() {
         if (edge == 1) {
             var prevEnd = 0L
             for ((j, o) in project.clips.withIndex()) {
-                if (j != i && o.endMs <= clip.startMs && o.endMs > prevEnd) prevEnd = o.endMs
+                if (j != i && o.track == clip.track &&
+                    o.endMs <= clip.startMs && o.endMs > prevEnd
+                ) prevEnd = o.endMs
             }
             minD = maxOf(-clip.trimStartMs, prevEnd - clip.startMs)
             maxD = clip.trimmedMs - 300L
         } else {
             var nextStart = Long.MAX_VALUE
             for ((j, o) in project.clips.withIndex()) {
-                if (j != i && o.startMs >= clip.endMs && o.startMs < nextStart) nextStart = o.startMs
+                if (j != i && o.track == clip.track &&
+                    o.startMs >= clip.endMs && o.startMs < nextStart
+                ) nextStart = o.startMs
             }
             val room = clip.durationMs - clip.trimEndMs
             maxD = if (nextStart == Long.MAX_VALUE) room else minOf(room, nextStart - clip.endMs)
@@ -445,23 +457,24 @@ class MainActivity : Activity() {
         afterEdit()
     }
 
-    private fun moveClip(i: Int, newStart: Long) {
+    private fun moveClip(i: Int, newStart: Long, newTrack: Int) {
         val clip = project.clips.getOrNull(i) ?: return
         val s = maxOf(0L, newStart)
+        val tr = newTrack.coerceIn(0, MAX_TRACKS - 1)
         val e = s + clip.trimmedMs
         for ((j, o) in project.clips.withIndex()) {
-            if (j != i && s < o.endMs && e > o.startMs) {
+            if (j != i && o.track == tr && s < o.endMs && e > o.startMs) {
                 toast("No room there, clips can't overlap")
                 timeline.invalidate()
                 return
             }
         }
-        if (s == clip.startMs) {
+        if (s == clip.startMs && tr == clip.track) {
             timeline.invalidate()
             return
         }
         pushUndo()
-        project.clips[i] = clip.copy(startMs = s)
+        project.clips[i] = clip.copy(startMs = s, track = tr)
         afterEdit()
     }
 
@@ -502,9 +515,11 @@ class MainActivity : Activity() {
             }
             runOnUiThread {
                 if (added.isNotEmpty()) pushUndo()
-                var cursor = project.totalMs()
+                // New clips go on the base track, after the last clip there.
+                var cursor = project.clips.filter { it.track == 0 }
+                    .maxOfOrNull { it.endMs } ?: 0L
                 for (c in added) {
-                    project.clips.add(c.copy(startMs = cursor))
+                    project.clips.add(c.copy(startMs = cursor, track = 0))
                     cursor += c.trimmedMs
                 }
                 project.save(projectFile)
@@ -559,7 +574,7 @@ class MainActivity : Activity() {
         val sel = project.clips.getOrNull(selected)
         var s = "${fmt(playheadMs)} / ${fmt(project.totalMs())}   |   ${project.clips.size} clips"
         if (sel != null) {
-            s += "\nSelected: starts ${fmt(sel.startMs)}, length ${fmt(sel.trimmedMs)}"
+            s += "\nSelected: track ${sel.track + 1}, starts ${fmt(sel.startMs)}, length ${fmt(sel.trimmedMs)}"
         }
         info.text = s
     }
@@ -583,7 +598,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         glView.onResume()
-        loadedClip = null
+        loaded.fill(null)
         needShow = true
         lastTickAt = SystemClock.elapsedRealtime()
         handler.post(ticker)
