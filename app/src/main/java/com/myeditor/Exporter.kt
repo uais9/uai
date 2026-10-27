@@ -8,6 +8,9 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import androidx.media3.common.MediaItem
+import androidx.media3.common.OverlaySettings
+import androidx.media3.common.VideoCompositorSettings
+import androidx.media3.common.util.Size
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.effect.Presentation
 import androidx.media3.transformer.Composition
@@ -23,6 +26,7 @@ import kotlin.concurrent.thread
 
 @OptIn(UnstableApi::class)
 class Exporter(private val activity: Activity) {
+
     private val progressHolder = ProgressHolder()
     private var transformer: Transformer? = null
 
@@ -33,7 +37,7 @@ class Exporter(private val activity: Activity) {
         val tr = transformer ?: return "Exporting..."
         val state = tr.getProgress(progressHolder)
         return if (state == Transformer.PROGRESS_STATE_AVAILABLE) {
-            "Exporting... ${progressHolder.progress}%  (keep the app open)"
+            "Exporting... ${progressHolder.progress}% (keep the app open)"
         } else {
             "Exporting..."
         }
@@ -78,17 +82,11 @@ class Exporter(private val activity: Activity) {
         return Pair(w, h)
     }
 
-    fun start(clips: List<Clip>, onFinished: (String, Boolean) -> Unit) {
-        val sorted = clips.sortedBy { it.startMs }
-        if (sorted.isEmpty()) {
-            onFinished("Add clips first", false)
-            return
-        }
-        val (w, h) = outputSize(sorted[0])
-
+    // Builds one "lane" of clips (one track), with gaps where the track is empty.
+    private fun buildSequence(trackClips: List<Clip>): EditedMediaItemSequence {
         val seq = EditedMediaItemSequence.Builder(emptyList<EditedMediaItem>())
         var cursor = 0L
-        for (c in sorted) {
+        for (c in trackClips) {
             if (c.startMs > cursor) {
                 seq.addGap((c.startMs - cursor) * 1000L)
             }
@@ -105,8 +103,45 @@ class Exporter(private val activity: Activity) {
         }
         seq.experimentalSetForceVideoTrack(true)
         seq.experimentalSetForceAudioTrack(true)
+        return seq.build()
+    }
 
-        val composition = Composition.Builder(seq.build())
+    fun start(clips: List<Clip>, onFinished: (String, Boolean) -> Unit) {
+        val sorted = clips.sortedBy { it.startMs }
+        if (sorted.isEmpty()) {
+            onFinished("Add clips first", false)
+            return
+        }
+        val (w, h) = outputSize(sorted[0])
+
+        // One lane per track, lowest track first (the bottom layer).
+        val byTrack = clips.groupBy { it.track }.toSortedMap()
+        val trackOrder = byTrack.keys.toList()
+        val sequences = trackOrder.map { t ->
+            buildSequence(byTrack[t]!!.sortedBy { it.startMs })
+        }
+
+        // Decides how see-through each layer is at each moment.
+        val compositorSettings = object : VideoCompositorSettings {
+            override fun getOutputSize(inputSizes: List<Size>): Size = Size(w, h)
+
+            override fun getOverlaySettings(
+                inputId: Int,
+                presentationTimeUs: Long
+            ): OverlaySettings {
+                val tMs = presentationTimeUs / 1000L
+                val track = trackOrder.getOrNull(inputId)
+                val clip = if (track == null) null else {
+                    byTrack[track]?.firstOrNull { tMs >= it.startMs && tMs < it.endMs }
+                }
+                return OverlaySettings.Builder()
+                    .setAlphaScale(clip?.opacity ?: 0f)
+                    .build()
+            }
+        }
+
+        val composition = Composition.Builder(sequences)
+            .setVideoCompositorSettings(compositorSettings)
             .setEffects(
                 Effects(
                     emptyList(),
