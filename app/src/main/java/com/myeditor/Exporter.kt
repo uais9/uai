@@ -9,6 +9,7 @@ import android.os.Environment
 import android.provider.MediaStore
 import androidx.media3.common.MediaItem
 import androidx.media3.common.OverlaySettings
+import androidx.media3.effect.StaticOverlaySettings
 import androidx.media3.common.VideoCompositorSettings
 import androidx.media3.common.util.Size
 import androidx.media3.common.util.UnstableApi
@@ -134,7 +135,7 @@ class Exporter(private val activity: Activity) {
                 val clip = if (track == null) null else {
                     byTrack[track]?.firstOrNull { tMs >= it.startMs && tMs < it.endMs }
                 }
-                return OverlaySettings.Builder()
+                return StaticOverlaySettings.Builder()
                     .setAlphaScale(clip?.opacity ?: 0f)
                     .build()
             }

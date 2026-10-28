@@ -69,13 +69,32 @@ class TimelineView(context: Context) : View(context) {
         strokeWidth = 2f * density
         isAntiAlias = true
     }
+    private val badgeBgPaint = Paint().apply {
+        color = Color.parseColor("#282832")
+        isAntiAlias = true
+    }
+    private val badgeTextPaint = Paint().apply {
+        color = Color.WHITE
+        textSize = 11f * density
+        isAntiAlias = true
+        textAlign = Paint.Align.CENTER
+    }
     private val handlePaint = Paint().apply {
         color = Color.WHITE
+        isAntiAlias = true
+    }
+    private val handleActivePaint = Paint().apply {
+        color = Color.parseColor("#FFD700")
         isAntiAlias = true
     }
     private val textPaint = Paint().apply {
         color = Color.WHITE
         textSize = 11f * density
+        isAntiAlias = true
+    }
+    private val trackLabelPaint = Paint().apply {
+        color = Color.parseColor("#66FFFFFF")
+        textSize = 9f * density
         isAntiAlias = true
     }
 
@@ -178,6 +197,7 @@ class TimelineView(context: Context) : View(context) {
         for (k2 in 0 until MAX_TRACKS) {
             val rt = rowTop(k2)
             canvas.drawRect(0f, rt, w, rt + rowH, rowPaint)
+            canvas.drawText("Track ${k2 + 1}", 6f * density, rt + 12f * density, trackLabelPaint)
         }
 
         if (clips.isEmpty()) {
@@ -249,18 +269,32 @@ class TimelineView(context: Context) : View(context) {
             }
 
             if (i == selectedIndex && movingIndex < 0) {
-                val hw = 7f * density
-                val hh = (bottom - top) * 0.6f
-                val mid = (top + bottom) / 2f
-                handleRect.set(left, mid - hh / 2f, left + hw, mid + hh / 2f)
-                canvas.drawRoundRect(handleRect, 3f * density, 3f * density, handlePaint)
-                handleRect.set(right - hw, mid - hh / 2f, right, mid + hh / 2f)
-                canvas.drawRoundRect(handleRect, 3f * density, 3f * density, handlePaint)
+                val hw = 8f * density
+                val pLeft = if (trimIndex == i && trimEdge == 1) handleActivePaint else handlePaint
+                val pRight = if (trimIndex == i && trimEdge == 2) handleActivePaint else handlePaint
+
+                handleRect.set(left - hw / 2f, top, left + hw / 2f, bottom)
+                canvas.drawRoundRect(handleRect, 3f * density, 3f * density, pLeft)
+
+                handleRect.set(right - hw / 2f, top, right + hw / 2f, bottom)
+                canvas.drawRoundRect(handleRect, 3f * density, 3f * density, pRight)
             }
         }
 
-        canvas.drawLine(cx, 0f, cx, h, headPaint)
-        canvas.drawCircle(cx, 4f * density, 4f * density, headPaint)
+        canvas.drawLine(cx, rulerH, cx, h, headPaint)
+
+        // Draw playhead time badge (00:00:00 format)
+        val totalSec = playheadMs / 1000
+        val mins = (totalSec / 60) % 60
+        val secs = totalSec % 60
+        val frames = ((playheadMs % 1000) * 30 / 1000).toInt()
+        val timecode = "%02d:%02d:%02d".format(mins, secs, frames)
+
+        val badgeW = 70f * density
+        val badgeH = 20f * density
+        val badgeRect = RectF(cx - badgeW / 2f, 2f * density, cx + badgeW / 2f, 2f * density + badgeH)
+        canvas.drawRoundRect(badgeRect, 4f * density, 4f * density, badgeBgPaint)
+        canvas.drawText(timecode, cx, 2f * density + 14f * density, badgeTextPaint)
     }
 
     override fun onTouchEvent(e: MotionEvent): Boolean {

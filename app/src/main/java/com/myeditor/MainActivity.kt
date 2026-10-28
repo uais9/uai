@@ -105,7 +105,9 @@ class MainActivity : Activity() {
         playBtn = small("Play") { togglePlay() }
         val controls = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
+            addView(small("|<") { stepFrame(-1) })
             addView(playBtn)
+            addView(small(">|") { stepFrame(1) })
             addView(small("Split") { splitHere() })
             addView(small("Trim start") { trimStart() })
             addView(small("Trim end") { trimEnd() })
@@ -252,6 +254,13 @@ class MainActivity : Activity() {
         } else {
             setPlayhead(t)
         }
+    }
+
+    private fun stepFrame(frames: Int) {
+        if (playing) stopPlayback()
+        val frameDurationMs = 33L
+        val target = (playheadMs + frames * frameDurationMs).coerceIn(0L, maxOf(0L, project.totalMs()))
+        scrubTo(target)
     }
 
     private fun togglePlay() {
